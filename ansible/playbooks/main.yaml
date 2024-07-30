@@ -1,1 +1,213 @@
+---
+- name: Configure servers
+  hosts: hng
+  become: true
+  become_method: sudo
+  become_user: root
+
+  vars:
+    postgres_user: admin
+    postgres_password: secure_password
+    db_name: myappdb
+    app_directory: /opt/stage_5b
+    log_directory: /var/log/stage_5b
+
+  tasks:
+    # Common tasks
+    - name: Create user hng with sudo privileges
+      ansible.builtin.user:
+        name: hng
+        groups: sudo
+        state: present
+        createhome: yes
+        shell: /bin/bash
+
+    - name: Update apt cache
+      ansible.builtin.apt:
+        update_cache: yes
+
+    - name: Install required packages
+      ansible.builtin.apt:
+        name: "{{ item }}"
+        state: present
+      with_items:
+        - acl
+        - git
+        - python3-pip
+        - python3-venv
+
+    - name: Ensure directories exist
+      ansible.builtin.file:
+        path: "{{ item }}"
+        state: directory
+        owner: hng
+        group: hng
+        mode: "{{ '0755' if item == '/opt/stage_5b' else '0700' }}"
+      loop:
+        - /opt/stage_5b
+        - /var/secrets
+
+    - name: Clone the DevOps branch of the repo into /opt/stage_5b
+      ansible.builtin.git:
+        repo: 'https://github.com/hngprojects/hng_boilerplate_golang_web.git'
+        version: devops
+        dest: /opt/stage_5b
+        force: yes
+        accept_hostkey: yes
+      become_user: hng
+
+    # PostgreSQL tasks
+    - name: Install PostgreSQL
+      ansible.builtin.apt:
+        name: "{{ item }}"
+        state: present
+      with_items:
+        - postgresql
+        - postgresql-contrib
+        - python3-psycopg2
+
+    - name: Start and enable PostgreSQL service
+      ansible.builtin.service:
+        name: postgresql
+        state: started
+        enabled: true
+
+    - name: Save PostgreSQL admin credentials
+      ansible.builtin.copy:
+        content: |
+          POSTGRES_USER={{ postgres_user }}
+          POSTGRES_PASSWORD={{ postgres_password }}
+        dest: /var/secrets/pg_pw.txt
+        owner: hng
+        group: hng
+        mode: '0600'
+
+    - name: Create PostgreSQL database and user
+      become_user: postgres
+      ansible.builtin.postgresql_db:
+        name: "{{ db_name }}"
+        state: present
+
+    - name: Create PostgreSQL user
+      become_user: postgres
+      ansible.builtin.postgresql_user:
+        name: "{{ postgres_user }}"
+        password: "{{ postgres_password }}"
+        state: present
+
+    - name: Grant all privileges on database to the user
+      become_user: postgres
+      ansible.builtin.postgresql_privs:
+        db: "{{ db_name }}"
+        role: "{{ postgres_user }}"
+        privs: ALL
+        type: database
+
+    # Application tasks
+    - name: Configure Git to trust the repository directory
+      ansible.builtin.command:
+        cmd: git config --global --add safe.directory /opt/stage_5b
+
+    - name: Change ownership of /opt/stage_5b
+      ansible.builtin.file:
+        path: /opt/stage_5b
+        state: directory
+        owner: hng
+        group: hng
+        recurse: yes
+
+    - name: Install Go
+      ansible.builtin.apt:
+        name: golang
+        state: present
+
+    - name: Build the Go application
+      command: go build -o /opt/stage_5b/app /opt/stage_5b
+      become_user: hng
+      args:
+        chdir: /opt/stage_5b
+
+    - name: Configure environment variables
+      ansible.builtin.copy:
+        content: |
+          PORT=3000
+          DATABASE_URL=postgresql://{{ postgres_user }}:{{ postgres_password }}@localhost/{{ db_name }}
+        dest: /opt/stage_5b/.env
+        owner: hng
+        group: hng
+        mode: '0600'
+
+    - name: Create systemd service for the application
+      ansible.builtin.copy:
+        content: |
+          [Unit]
+          Description=Golang App
+          After=network.target
+
+          [Service]
+          User=hng
+          WorkingDirectory=/opt/stage_5b
+          ExecStart=/opt/stage_5b/app
+          EnvironmentFile=/opt/stage_5b/.env
+          StandardOutput=file:/var/log/stage_5b/out.log
+          StandardError=file:/var/log/stage_5b/error.log
+
+          [Install]
+          WantedBy=multi-user.target
+        dest: /etc/systemd/system/golang_app.service
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Reload systemd to apply changes
+      ansible.builtin.systemd:
+        daemon_reload: yes
+
+    - name: Start and enable the Golang app service
+      ansible.builtin.systemd:
+        name: golang_app
+        state: started
+        enabled: true
+
+    # Nginx tasks
+    - name: Install Nginx
+      ansible.builtin.apt:
+        name: nginx
+        state: present
+
+    - name: Start and enable Nginx service
+      ansible.builtin.service:
+        name: nginx
+        state: started
+        enabled: true
+
+    - name: Configure Nginx to reverse proxy
+      ansible.builtin.copy:
+        content: |
+          server {
+            listen 80;
+            server_name localhost;
+
+            location / {
+              proxy_pass http://127.0.0.1:3000;
+              proxy_http_version 1.1;
+              proxy_set_header Upgrade $http_upgrade;
+              proxy_set_header Connection 'upgrade';
+              proxy_set_header Host $host;
+              proxy_cache_bypass $http_upgrade;
+            }
+          }
+        dest: /etc/nginx/sites-available/default
+        owner: root
+        group: root
+        mode: '0644'
+
+    - name: Test Nginx configuration
+      ansible.builtin.command:
+        cmd: nginx -t
+
+    - name: Reload Nginx
+      ansible.builtin.service:
+        name: nginx
+        state: reloaded
 
